@@ -11,7 +11,7 @@ class S3Service {
         secretAccessKey: process.env.REACT_APP_AWS_SECRET_ACCESS_KEY
       }
     });
-    this.bucketName = 'ai.hassah.frankfurt';
+    this.bucketName = 'ai.hadassah.frankfurt';
   }
 
   async getFirstTranscription(sessionId) {
