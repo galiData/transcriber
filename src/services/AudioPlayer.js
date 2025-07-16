@@ -10,6 +10,7 @@ const AudioPlayer = ({ sessionId, recordingType }) => {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState(null);
   const [retryCount, setRetryCount] = useState(0);
+  const retryCountRef = useRef(0);
 
   const audioRef = useRef(null);
   const s3Client = useRef(S3Service.client);
@@ -32,6 +33,9 @@ const AudioPlayer = ({ sessionId, recordingType }) => {
 
     const maxRetries = 30; // 1 minute with 2-second intervals
     const retryInterval = 2000;
+
+    retryCountRef.current = 0;
+    setRetryCount(0);
 
     const attemptLoad = async () => {
       try {
@@ -67,7 +71,7 @@ const AudioPlayer = ({ sessionId, recordingType }) => {
         }
         return true;
       } catch (error) {
-        console.log(`Attempt ${retryCount + 1}/${maxRetries} failed:`, error);
+        console.log(`Attempt ${retryCountRef.current + 1}/${maxRetries} failed:`, error);
         return false;
       }
     };
@@ -80,8 +84,9 @@ const AudioPlayer = ({ sessionId, recordingType }) => {
         return;
       }
 
-      if (retryCount < maxRetries) {
-        setRetryCount(prev => prev + 1);
+      if (retryCountRef.current < maxRetries) {
+        retryCountRef.current += 1;
+        setRetryCount(retryCountRef.current);
         pollingTimeoutRef.current = setTimeout(pollForAudio, retryInterval);
       } else {
         setIsLoading(false);
