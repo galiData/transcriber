@@ -6,7 +6,6 @@ import S3Service, { createSessionId } from './services/S3Service';
 import { aiAgentClean, aiAgentSummary } from './services/AgentService';
 import AudioPlayer from './services/AudioPlayer';
 import DictionaryEditor from './services/DictionaryEditor';
-import { GetObjectCommand } from "@aws-sdk/client-s3";
 import TextDisplay from './services/TextDisplay';
 import TranscriptionConfig from './components/TranscriptionConfig';
 
@@ -18,15 +17,12 @@ const MedicalTranscription = () => {
   const [audioLevel, setAudioLevel] = useState(0);
   const [uploadingFile, setUploadingFile] = useState(false);
   const [selectedFileName, setSelectedFileName] = useState('');
-  const [isLoadingTranscription, setIsLoadingTranscription] = useState(false);
 
   const fileInputRef = useRef(null);
   const [sessionId, setSessionId] = useState(null);
   const recordedChunksRef = useRef([]);
 
-  const partialTranscriptRef = useRef('');
   const completeTranscriptsRef = useRef([]);
-  const currentSpeakerRef = useRef(null);
   
   const mediaRecorderRef = useRef(null);
   const audioContextRef = useRef(null);
@@ -38,8 +34,10 @@ const MedicalTranscription = () => {
 
   const [isProcessingAI, setIsProcessingAI] = useState(false);
 
-  const [numSpeakers, setNumSpeakers] = useState(1);
-  const [language, setLanguage] = useState('he-IL');
+  const [numSpeakers, setNumSpeakers] = useState(10); // Auto-detect speakers up to 10
+  const [language, setLanguage] = useState('he-IL'); // Hebrew default
+  
+  const transcribeClientRef = useRef(null);
 
   const handleCleanText = async () => {
     if (!sessionId) {
@@ -91,7 +89,6 @@ const MedicalTranscription = () => {
 
 
   const loadTranscription = async (sessionId) => {
-    setIsLoadingTranscription(true);
     setError('');
     
     try {
@@ -132,8 +129,6 @@ const MedicalTranscription = () => {
     } catch (error) {
       console.error('Error loading transcription:', error);
       setError(`Failed to load transcription: ${error.message}`);
-    } finally {
-      setIsLoadingTranscription(false);
     }
   };
 
@@ -213,7 +208,7 @@ const MedicalTranscription = () => {
     }
 };
 
-  const transcribeClient = new TranscribeStreamingClient({
+  const createTranscribeClient = () => new TranscribeStreamingClient({
     region: process.env.REACT_APP_AWS_REGION || 'us-east-1',
     credentials: {
       accessKeyId: process.env.REACT_APP_AWS_ACCESS_KEY_ID,
@@ -221,7 +216,7 @@ const MedicalTranscription = () => {
     },
     requestHandler: {
       ...new FetchHttpHandler({
-        requestTimeout: 600000
+        requestTimeout: 30000 // Ultra-responsive 30 second timeout
       }),
       metadata: {
         handlerProtocol: 'h2'
@@ -238,16 +233,16 @@ const MedicalTranscription = () => {
       if (!audioContextRef.current) {
         const context = new AudioContext({
           sampleRate: 16000,
-          latencyHint: 'interactive'
+          latencyHint: 'playback' // Fastest possible audio processing
         });
 
         // Create gain node
         gainNodeRef.current = context.createGain();
         gainNodeRef.current.gain.value = 5.0;
 
-        // Create analyser node
+        // Create analyser node with smaller buffer for faster processing
         analyserRef.current = context.createAnalyser();
-        analyserRef.current.fftSize = 2048;
+        analyserRef.current.fftSize = 1024; // Smaller for faster response
 
         await context.audioWorklet.addModule('/audio-processor.js');
         audioContextRef.current = context;
@@ -265,8 +260,9 @@ const MedicalTranscription = () => {
   const startTranscription = useCallback(async (stream) => {
     let isStreaming = true;
     const audioQueue = [];
-    let accumulatedBytes = 0;
     let queueInterval;
+    let lastAudioTime = Date.now();
+    let pauseDetectionTimer = null;
   
     try {
       const source = audioContextRef.current.createMediaStreamSource(stream);
@@ -286,7 +282,11 @@ const MedicalTranscription = () => {
   
           if (stats.activeFrames > 0) {
             audioQueue.push(buffer);
+            lastAudioTime = Date.now();
+            // Audio data queued - force immediate processing
           }
+          
+          // Only process significant audio to avoid overwhelming the system
   
           setAudioLevel(Math.min(100, event.data.rms * 200));
         }
@@ -294,8 +294,16 @@ const MedicalTranscription = () => {
   
       const audioStream = new ReadableStream({
         start(controller) {
+          console.log('Starting audio stream controller...');
           queueInterval = setInterval(() => {
             if (!isStreaming) {
+              console.log('Streaming stopped, flushing remaining audio...');
+              // Flush remaining audio data before closing
+              while (audioQueue.length > 0) {
+                const chunk = audioQueue.shift();
+                controller.enqueue(chunk);
+                console.log('Flushed audio chunk');
+              }
               controller.close();
               return;
             }
@@ -303,12 +311,16 @@ const MedicalTranscription = () => {
             if (audioQueue.length > 0) {
               const chunk = audioQueue.shift();
               controller.enqueue(chunk);
-              accumulatedBytes += chunk.length;
+              // Minimal logging for performance
             }
-          }, 5); // Reduced interval for faster processing
+          }, 20); // Balanced 20ms for smooth streaming without overload
         },
         cancel() {
           isStreaming = false;
+          // Flush remaining audio data
+          while (audioQueue.length > 0) {
+            audioQueue.shift();
+          }
           clearInterval(queueInterval);
         }
       });
@@ -317,90 +329,322 @@ const MedicalTranscription = () => {
         LanguageCode: language,
         MediaEncoding: 'pcm',
         MediaSampleRateHertz: 16000,
-        EnableSpeakerIdentification: numSpeakers > 1,
-        NumberOfParticipants: numSpeakers,
-        ShowSpeakerLabel: numSpeakers > 1,
-        EnablePartialResultsStabilization: true,
-        PartialResultsStability: 'low',
-        VocabularyName: 'transcriber-he-punctuation',
+        // Ultra-responsive configuration for minimal latency
+        EnableSpeakerIdentification: true,
+        MaxSpeakerCount: 2,
+        ShowSpeakerLabel: true,
+        EnablePartialResultsStabilization: true, // Enable for reliable partial results
+        PartialResultsStability: 'low', // Low stability for good responsiveness
+        EnableChannelIdentification: false,
         AudioStream: async function* () {
+          console.log('Starting audio stream generator...');
           const reader = audioStream.getReader();
+          let chunkCount = 0;
           try {
             while (true) {
               const { done, value } = await reader.read();
-              if (done) break;
+              if (done) {
+                console.log('Audio stream completed');
+                break;
+              }
               if (value) {
+                chunkCount++;
+                console.log(`Yielding audio chunk ${chunkCount}, size: ${value.length}`);
                 yield { AudioEvent: { AudioChunk: value } };
               }
             }
+          } catch (error) {
+            console.error('Error in audio stream generator:', error);
           } finally {
+            console.log('Audio stream generator cleanup');
             reader.releaseLock();
           }
         }()
       });
   
-      const response = await transcribeClient.send(command);
+      // Create transcribe client if not exists
+      if (!transcribeClientRef.current) {
+        console.log('Creating new AWS Transcribe client...');
+        transcribeClientRef.current = createTranscribeClient();
+      }
+      
+      console.log('Sending command to AWS Transcribe...');
+      console.log('AWS Credentials check:', {
+        hasAccessKey: !!process.env.REACT_APP_AWS_ACCESS_KEY_ID,
+        hasSecretKey: !!process.env.REACT_APP_AWS_SECRET_ACCESS_KEY,
+        region: process.env.REACT_APP_AWS_REGION || 'us-east-1',
+        accessKeyStart: process.env.REACT_APP_AWS_ACCESS_KEY_ID?.substring(0, 8) + '...',
+      });
+      
+      let response;
+      try {
+        response = await transcribeClientRef.current.send(command);
+        console.log('AWS Transcribe connection established successfully');
+      } catch (connectionError) {
+        console.error('AWS Transcribe connection failed:', connectionError);
+        setTranscription(`❌ AWS Connection Error: ${connectionError.message}`);
+        throw connectionError;
+      }
   
       // Initialize state with more efficient handling
       let currentTranscript = '';
-      let lastPartialTimestamp = Date.now();
+      let currentSpeaker = null;
+      let pauseDetected = false;
+      let lastTranscriptTime = Date.now();
       completeTranscriptsRef.current = [];
       
+      // Test if setTranscription is working
+      console.log('Testing setTranscription...');
+      setTranscription('🔴 Recording started - waiting for speech...');
+      
+      console.log('Starting to listen for AWS Transcribe events...');
+      
+      // Add timeout to catch hanging - more responsive
+      let eventCount = 0;
+      const timeoutId = setTimeout(() => {
+        console.warn('No events received from AWS Transcribe after 5 seconds');
+        setTranscription('⚠️ No response from AWS Transcribe - check credentials and connection');
+      }, 5000);
+
       for await (const event of response.TranscriptResultStream) {
+        eventCount++;
+        console.log(`Received AWS event ${eventCount}:`, event);
+        clearTimeout(timeoutId);
+        
         if (event.TranscriptEvent?.Transcript?.Results?.[0]) {
+          console.log('Found transcript result');
           const result = event.TranscriptEvent.Transcript.Results[0];
+          
+          // Check for speech pause detection
+          const currentTime = Date.now();
+          const timeSinceLastTranscript = currentTime - lastTranscriptTime;
+          
+          // If more than 1.5 seconds has passed since last transcript, consider it a significant pause
+          // Balanced to catch natural speaker transitions without splitting sentences
+          if (timeSinceLastTranscript > 1500) {
+            pauseDetected = true;
+            console.log('Pause detected:', timeSinceLastTranscript + 'ms');
+          }
+          
+          lastTranscriptTime = currentTime;
           
           if (result.Alternatives?.[0]) {
             const alternative = result.Alternatives[0];
             const newText = alternative.Transcript || '';
             
-            // Handle speaker labels
+            // Minimal result logging for better performance
+            
+            // Enhanced speaker detection with overlapping speech analysis
+            let speakerId = null;
             let speakerLabel = '';
-            if (numSpeakers > 1) {
-              if (alternative.Items?.length > 0) {
-                const speakerItem = alternative.Items.find(item => item.Speaker);
-                if (speakerItem) {
-                  speakerLabel = `[דובר ${speakerItem.Speaker}]: `;
+            let allSpeakersInSegment = [];
+            
+            // Strategy 1: Analyze items to detect multiple speakers in same segment
+            if (alternative.Items?.length > 0) {
+              const speakerCounts = {};
+              const speakerPositions = {};
+              
+              alternative.Items.forEach((item, index) => {
+                if (item.Speaker !== undefined && item.Speaker !== null) {
+                  const speaker = item.Speaker.toString();
+                  speakerCounts[speaker] = (speakerCounts[speaker] || 0) + 1;
+                  
+                  if (!speakerPositions[speaker]) {
+                    speakerPositions[speaker] = [];
+                  }
+                  speakerPositions[speaker].push(index);
                 }
-              } else if (result.Speaker) {
-                speakerLabel = `[דובר ${result.Speaker}]: `;
+              });
+              
+              allSpeakersInSegment = Object.keys(speakerCounts).sort();
+              
+              // Check for overlapping speech patterns
+              if (allSpeakersInSegment.length > 1) {
+                // Multiple speakers detected - check if they're overlapping or sequential
+                let isOverlapping = false;
+                
+                // Simple overlap detection: if speakers appear interspersed
+                const speakers = alternative.Items
+                  .filter(item => item.Speaker !== undefined)
+                  .map(item => item.Speaker.toString());
+                
+                // Enhanced overlap detection with multiple strategies
+                
+                // Strategy A: Look for interspersed speakers (A-B-A pattern)
+                for (let i = 1; i < speakers.length - 1; i++) {
+                  if (speakers[i] !== speakers[i-1] && speakers[i] !== speakers[i+1]) {
+                    isOverlapping = true;
+                    break;
+                  }
+                }
+                
+                // Strategy B: Check for rapid speaker switches (more than 2 switches in short segment)
+                if (!isOverlapping && speakers.length > 4) {
+                  const switchCount = speakers.reduce((count, speaker, index) => {
+                    return index > 0 && speaker !== speakers[index - 1] ? count + 1 : count;
+                  }, 0);
+                  
+                  if (switchCount >= 3) { // Multiple quick switches indicate overlap
+                    isOverlapping = true;
+                  }
+                }
+                
+                // Strategy C: Check if both speakers have significant presence (>30% each)
+                if (!isOverlapping && allSpeakersInSegment.length === 2) {
+                  const totalWords = Object.values(speakerCounts).reduce((a, b) => a + b, 0);
+                  const minThreshold = totalWords * 0.3;
+                  
+                  if (speakerCounts[allSpeakersInSegment[0]] >= minThreshold && 
+                      speakerCounts[allSpeakersInSegment[1]] >= minThreshold) {
+                    isOverlapping = true;
+                  }
+                }
+                
+                if (isOverlapping) {
+                  // True overlapping speech
+                  speakerId = allSpeakersInSegment.join(',');
+                  speakerLabel = `[דוברים ${allSpeakersInSegment.join(',')} - חפיפה]: `;
+                } else {
+                  // Sequential speakers in same segment - use dominant speaker
+                  const dominantSpeaker = Object.keys(speakerCounts).reduce((a, b) => 
+                    speakerCounts[a] > speakerCounts[b] ? a : b
+                  );
+                  speakerId = dominantSpeaker;
+                  speakerLabel = `[דובר ${speakerId}]: `;
+                }
+              } else if (allSpeakersInSegment.length === 1) {
+                // Single clear speaker
+                speakerId = allSpeakersInSegment[0];
+                speakerLabel = `[דובר ${speakerId}]: `;
+              }
+            }
+            
+            // Strategy 2: Check result/alternative level speakers as backup
+            if (!speakerId) {
+              if (alternative.Speaker !== undefined && alternative.Speaker !== null) {
+                speakerId = alternative.Speaker.toString();
+                speakerLabel = `[דובר ${speakerId}]: `;
+              } else if (result.Speaker !== undefined && result.Speaker !== null) {
+                speakerId = result.Speaker.toString();
+                speakerLabel = `[דובר ${speakerId}]: `;
+              }
+            }
+            
+            // Fallback: continue with current speaker
+            if (!speakerId && currentSpeaker) {
+              speakerId = currentSpeaker;
+              if (speakerId.includes(',')) {
+                speakerLabel = `[דוברים ${speakerId}]: `;
+              } else {
+                speakerLabel = `[דובר ${speakerId}]: `;
               }
             }
   
-            // Update partial results more frequently
-            const now = Date.now();
-            const shouldUpdatePartial = now - lastPartialTimestamp > 100; // Update every 100ms
   
             if (result.IsPartial) {
-              if (shouldUpdatePartial) {
+              // Efficient partial processing - update on meaningful changes
+              if (newText !== currentTranscript) {
+                
+                // Enhanced speaker change detection with overlap handling
+                const isDifferentSpeaker = speakerId && currentSpeaker && currentSpeaker !== speakerId;
+                
+                if (isDifferentSpeaker) {
+                  // Commit current transcript when speakers definitively change
+                  if (currentTranscript.trim()) {
+                    let prevLabel;
+                    if (currentSpeaker.includes(',')) {
+                      if (currentSpeaker.includes('-')) {
+                        prevLabel = `[דוברים ${currentSpeaker.split(' - ')[0]} - חפיפה]: `;
+                      } else {
+                        prevLabel = `[דוברים ${currentSpeaker}]: `;
+                      }
+                    } else {
+                      prevLabel = `[דובר ${currentSpeaker}]: `;
+                    }
+                    completeTranscriptsRef.current.push(prevLabel + currentTranscript);
+                    
+                    // Log the change with overlap detection
+                    const changeType = speakerId.includes(',') ? 'overlap detected' : 'speaker change';
+                    console.log(`${changeType}:`, currentSpeaker, '->', speakerId);
+                  }
+                }
+                
+                // Reset pause detection after processing (regardless of speaker change)
+                if (pauseDetected) {
+                  pauseDetected = false;
+                }
+                
+                // Update state with zero delay
                 currentTranscript = newText;
-                lastPartialTimestamp = now;
+                if (speakerId) {
+                  currentSpeaker = speakerId;
+                }
                 
-                // Immediately update UI with partial result
-                const displayText = [
-                  ...completeTranscriptsRef.current,
-                  speakerLabel + currentTranscript
-                ].filter(Boolean).join('\n');
+                // Ultra-immediate UI update with forced synchronous processing
+                const displayText = completeTranscriptsRef.current.length > 0 
+                  ? completeTranscriptsRef.current.join('\n') + '\n' + speakerLabel + currentTranscript
+                  : speakerLabel + currentTranscript;
                 
+                // Immediate synchronous update - no delays whatsoever
                 setTranscription(displayText);
               }
             } else {
-              // For final results
-              completeTranscriptsRef.current.push(speakerLabel + newText);
-              currentTranscript = ''; // Reset current transcript
-              
-              // Always update UI immediately for final results
-              const displayText = completeTranscriptsRef.current.join('\n');
-              setTranscription(displayText);
+              // For final results - commit the text permanently
+              if (newText.trim()) {
+                // Conservative speaker change detection for final results
+                const isSpeakerChange = speakerId && currentSpeaker && (
+                  currentSpeaker !== speakerId // Only on actual different speaker
+                );
+                
+                if (isSpeakerChange) {
+                  console.log('Speaker change in final result:', currentSpeaker, '->', speakerId, 'pause:', pauseDetected);
+                }
+                
+                // Reset pause detection after processing final result
+                pauseDetected = false;
+                
+                // Commit the final result with speaker label
+                completeTranscriptsRef.current.push(speakerLabel + newText);
+                currentTranscript = ''; // Reset current transcript
+                
+                // Update current speaker for final results
+                if (speakerId) {
+                  currentSpeaker = speakerId;
+                }
+                
+                // Always update UI immediately for final results
+                const displayText = completeTranscriptsRef.current.join('\n');
+                setTranscription(displayText);
+              }
             }
           }
         }
       }
     } catch (error) {
-      console.error('Transcription error:', error);
+      console.error('Transcription error details:', {
+        name: error.name,
+        message: error.message,
+        code: error.code,
+        statusCode: error.$metadata?.httpStatusCode,
+        stack: error.stack
+      });
+      
+      if (error.name === 'CredentialsProviderError') {
+        setTranscription('❌ AWS Credentials Error - Check your .env file');
+      } else if (error.name === 'NetworkingError') {
+        setTranscription('❌ Network Error - Check your internet connection');
+      } else if (error.code === 'AccessDeniedException') {
+        setTranscription('❌ AWS Access Denied - Check your IAM permissions');
+      } else {
+        setTranscription(`❌ Error: ${error.message}`);
+      }
+      
       throw error;
     } finally {
       clearInterval(queueInterval);
+      if (pauseDetectionTimer) {
+        clearTimeout(pauseDetectionTimer);
+      }
     }
   }, [isRecording, language, numSpeakers]);
 
@@ -422,10 +666,17 @@ const MedicalTranscription = () => {
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
+          noiseSuppression: false,
+          autoGainControl: false,
           channelCount: 1,
-          sampleRate: 16000
+          sampleRate: 16000,
+          latency: 0.02, // Balanced 20ms latency for stable streaming
+          volume: 1.0,
+          googEchoCancellation: true,
+          googAutoGainControl: false,
+          googNoiseSuppression: false,
+          googHighpassFilter: false,
+          googTypingNoiseDetection: false
         }
       });
 
@@ -460,12 +711,18 @@ const MedicalTranscription = () => {
     setIsProcessing(true);
 
     try {
+      // Ultra-minimal flush time for maximum responsiveness
+      await new Promise(resolve => setTimeout(resolve, 50));
+      
       if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
         mediaRecorderRef.current.stop();
         await new Promise(resolve => {
           mediaRecorderRef.current.onstop = resolve;
         });
       }
+      
+      // Reduced delay to ensure transcription service processes final audio
+      await new Promise(resolve => setTimeout(resolve, 100));
 
       // Create audio blob from recorded chunks
       if (recordedChunksRef.current.length > 0) {
