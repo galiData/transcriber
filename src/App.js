@@ -12,6 +12,7 @@ import TranscriptionConfig from './components/TranscriptionConfig';
 const MedicalTranscription = () => {
   const [isRecording, setIsRecording] = useState(false);
   const [transcription, setTranscription] = useState('');
+  const lastDisplayUpdateRef = useRef(0);
   const [error, setError] = useState('');
   const [isProcessing, setIsProcessing] = useState(false);
   const [audioLevel, setAudioLevel] = useState(0);
@@ -23,6 +24,7 @@ const MedicalTranscription = () => {
   const recordedChunksRef = useRef([]);
 
   const completeTranscriptsRef = useRef([]);
+  const displayTextCacheRef = useRef('');
   
   const mediaRecorderRef = useRef(null);
   const audioContextRef = useRef(null);
@@ -329,6 +331,7 @@ const MedicalTranscription = () => {
         LanguageCode: language,
         MediaEncoding: 'pcm',
         MediaSampleRateHertz: 16000,
+        VocabularyName: 'transcriber-he-punctuation',
         // Ultra-responsive configuration for minimal latency
         EnableSpeakerIdentification: true,
         MaxSpeakerCount: 2,
@@ -392,6 +395,7 @@ const MedicalTranscription = () => {
       let pauseDetected = false;
       let lastTranscriptTime = Date.now();
       completeTranscriptsRef.current = [];
+      displayTextCacheRef.current = ''; // Reset cache
       
       // Test if setTranscription is working
       console.log('Testing setTranscription...');
@@ -419,9 +423,9 @@ const MedicalTranscription = () => {
           const currentTime = Date.now();
           const timeSinceLastTranscript = currentTime - lastTranscriptTime;
           
-          // If more than 1.5 seconds has passed since last transcript, consider it a significant pause
-          // Balanced to catch natural speaker transitions without splitting sentences
-          if (timeSinceLastTranscript > 1500) {
+          // If more than 1.2 seconds has passed since last transcript, consider it a significant pause
+          // Reduced threshold to better catch speaker transitions
+          if (timeSinceLastTranscript > 1200) {
             pauseDetected = true;
             console.log('Pause detected:', timeSinceLastTranscript + 'ms');
           }
@@ -434,87 +438,74 @@ const MedicalTranscription = () => {
             
             // Minimal result logging for better performance
             
-            // Enhanced speaker detection with overlapping speech analysis
+            // Improved speaker detection with better accuracy
             let speakerId = null;
             let speakerLabel = '';
-            let allSpeakersInSegment = [];
             
-            // Strategy 1: Analyze items to detect multiple speakers in same segment
+            // Strategy 1: Analyze items for speaker detection with confidence thresholds
             if (alternative.Items?.length > 0) {
               const speakerCounts = {};
-              const speakerPositions = {};
+              const totalItems = alternative.Items.length;
               
-              alternative.Items.forEach((item, index) => {
+              alternative.Items.forEach((item) => {
                 if (item.Speaker !== undefined && item.Speaker !== null) {
                   const speaker = item.Speaker.toString();
                   speakerCounts[speaker] = (speakerCounts[speaker] || 0) + 1;
-                  
-                  if (!speakerPositions[speaker]) {
-                    speakerPositions[speaker] = [];
-                  }
-                  speakerPositions[speaker].push(index);
                 }
               });
               
-              allSpeakersInSegment = Object.keys(speakerCounts).sort();
+              const speakers = Object.keys(speakerCounts);
               
-              // Check for overlapping speech patterns
-              if (allSpeakersInSegment.length > 1) {
-                // Multiple speakers detected - check if they're overlapping or sequential
-                let isOverlapping = false;
+              if (speakers.length === 1) {
+                // Single clear speaker
+                speakerId = speakers[0];
+                speakerLabel = `[דובר ${speakerId}]: `;
+              } else if (speakers.length === 2) {
+                // Two speakers detected - check confidence
+                const [speaker1, speaker2] = speakers;
+                const speaker1Ratio = speakerCounts[speaker1] / totalItems;
+                const speaker2Ratio = speakerCounts[speaker2] / totalItems;
                 
-                // Simple overlap detection: if speakers appear interspersed
-                const speakers = alternative.Items
-                  .filter(item => item.Speaker !== undefined)
-                  .map(item => item.Speaker.toString());
-                
-                // Enhanced overlap detection with multiple strategies
-                
-                // Strategy A: Look for interspersed speakers (A-B-A pattern)
-                for (let i = 1; i < speakers.length - 1; i++) {
-                  if (speakers[i] !== speakers[i-1] && speakers[i] !== speakers[i+1]) {
-                    isOverlapping = true;
-                    break;
-                  }
-                }
-                
-                // Strategy B: Check for rapid speaker switches (more than 2 switches in short segment)
-                if (!isOverlapping && speakers.length > 4) {
-                  const switchCount = speakers.reduce((count, speaker, index) => {
-                    return index > 0 && speaker !== speakers[index - 1] ? count + 1 : count;
-                  }, 0);
+                // Only consider multiple speakers if both have significant presence (>20% each)
+                // and the segment is long enough (>6 items) to avoid AWS false positives
+                if (totalItems >= 6 && speaker1Ratio >= 0.2 && speaker2Ratio >= 0.2) {
+                  // Check for true overlap vs sequential speech
+                  const speakers = alternative.Items
+                    .filter(item => item.Speaker !== undefined)
+                    .map(item => item.Speaker.toString());
                   
-                  if (switchCount >= 3) { // Multiple quick switches indicate overlap
-                    isOverlapping = true;
+                  // Simple overlap detection: look for A-B-A pattern indicating true overlap
+                  let hasOverlapPattern = false;
+                  for (let i = 1; i < speakers.length - 1; i++) {
+                    if (speakers[i] !== speakers[i-1] && speakers[i] !== speakers[i+1]) {
+                      hasOverlapPattern = true;
+                      break;
+                    }
                   }
-                }
-                
-                // Strategy C: Check if both speakers have significant presence (>30% each)
-                if (!isOverlapping && allSpeakersInSegment.length === 2) {
-                  const totalWords = Object.values(speakerCounts).reduce((a, b) => a + b, 0);
-                  const minThreshold = totalWords * 0.3;
                   
-                  if (speakerCounts[allSpeakersInSegment[0]] >= minThreshold && 
-                      speakerCounts[allSpeakersInSegment[1]] >= minThreshold) {
-                    isOverlapping = true;
+                  if (hasOverlapPattern) {
+                    // Use unique speakers only to avoid duplication
+                    const uniqueSpeakers = [...new Set(speakers)].sort();
+                    speakerId = uniqueSpeakers.join(',');
+                    speakerLabel = `[דוברים ${uniqueSpeakers.join(',')} - חפיפה]: `;
+                  } else {
+                    // Sequential speech - use dominant speaker
+                    const dominantSpeaker = speaker1Ratio > speaker2Ratio ? speaker1 : speaker2;
+                    speakerId = dominantSpeaker;
+                    speakerLabel = `[דובר ${speakerId}]: `;
                   }
-                }
-                
-                if (isOverlapping) {
-                  // True overlapping speech
-                  speakerId = allSpeakersInSegment.join(',');
-                  speakerLabel = `[דוברים ${allSpeakersInSegment.join(',')} - חפיפה]: `;
                 } else {
-                  // Sequential speakers in same segment - use dominant speaker
-                  const dominantSpeaker = Object.keys(speakerCounts).reduce((a, b) => 
-                    speakerCounts[a] > speakerCounts[b] ? a : b
-                  );
+                  // Use dominant speaker when confidence is low or segment is short
+                  const dominantSpeaker = speakerCounts[speaker1] > speakerCounts[speaker2] ? speaker1 : speaker2;
                   speakerId = dominantSpeaker;
                   speakerLabel = `[דובר ${speakerId}]: `;
                 }
-              } else if (allSpeakersInSegment.length === 1) {
-                // Single clear speaker
-                speakerId = allSpeakersInSegment[0];
+              } else if (speakers.length > 2) {
+                // More than 2 speakers - likely AWS confusion, use most frequent
+                const dominantSpeaker = speakers.reduce((a, b) => 
+                  speakerCounts[a] > speakerCounts[b] ? a : b
+                );
+                speakerId = dominantSpeaker;
                 speakerLabel = `[דובר ${speakerId}]: `;
               }
             }
@@ -545,11 +536,16 @@ const MedicalTranscription = () => {
               // Efficient partial processing - update on meaningful changes
               if (newText !== currentTranscript) {
                 
-                // Enhanced speaker change detection with overlap handling
+                // Enhanced speaker change detection with confidence-based transitions
                 const isDifferentSpeaker = speakerId && currentSpeaker && currentSpeaker !== speakerId;
                 
-                if (isDifferentSpeaker) {
-                  // Commit current transcript when speakers definitively change
+                // Additional check: ensure speaker change is consistent across multiple partial results
+                const speakerChangeConfidence = speakerId && currentSpeaker ? (
+                  !speakerId.includes(',') && !currentSpeaker.includes(',') && speakerId !== currentSpeaker
+                ) : false;
+                
+                if (isDifferentSpeaker && speakerChangeConfidence) {
+                  // Commit current transcript when speakers definitively change with confidence
                   if (currentTranscript.trim()) {
                     let prevLabel;
                     if (currentSpeaker.includes(',')) {
@@ -561,7 +557,14 @@ const MedicalTranscription = () => {
                     } else {
                       prevLabel = `[דובר ${currentSpeaker}]: `;
                     }
-                    completeTranscriptsRef.current.push(prevLabel + currentTranscript);
+                    const newEntry = prevLabel + currentTranscript;
+                    const lastEntry = completeTranscriptsRef.current[completeTranscriptsRef.current.length - 1];
+                    
+                    // Only add if it's different from the last entry to prevent repetition
+                    if (!lastEntry || lastEntry !== newEntry) {
+                      completeTranscriptsRef.current.push(newEntry);
+                    }
+                    displayTextCacheRef.current = ''; // Invalidate cache
                     
                     // Log the change with overlap detection
                     const changeType = speakerId.includes(',') ? 'overlap detected' : 'speaker change';
@@ -580,20 +583,28 @@ const MedicalTranscription = () => {
                   currentSpeaker = speakerId;
                 }
                 
-                // Ultra-immediate UI update with forced synchronous processing
-                const displayText = completeTranscriptsRef.current.length > 0 
-                  ? completeTranscriptsRef.current.join('\n') + '\n' + speakerLabel + currentTranscript
-                  : speakerLabel + currentTranscript;
-                
-                // Immediate synchronous update - no delays whatsoever
-                setTranscription(displayText);
+                // Optimized UI update with caching and throttling
+                const now = Date.now();
+                if (now - lastDisplayUpdateRef.current >= 16) { // Update at ~60fps for near real-time partial results
+                  // Use cached base text to avoid rebuilding entire string
+                  if (completeTranscriptsRef.current.length > 0) {
+                    if (!displayTextCacheRef.current || displayTextCacheRef.current.split('\n').length !== completeTranscriptsRef.current.length) {
+                      displayTextCacheRef.current = completeTranscriptsRef.current.join('\n');
+                    }
+                    setTranscription(displayTextCacheRef.current + '\n' + speakerLabel + currentTranscript);
+                  } else {
+                    setTranscription(speakerLabel + currentTranscript);
+                  }
+                  lastDisplayUpdateRef.current = now;
+                }
               }
             } else {
               // For final results - commit the text permanently
               if (newText.trim()) {
-                // Conservative speaker change detection for final results
+                // More reliable speaker change detection for final results
                 const isSpeakerChange = speakerId && currentSpeaker && (
-                  currentSpeaker !== speakerId // Only on actual different speaker
+                  currentSpeaker !== speakerId && // Only on actual different speaker
+                  !speakerId.includes(',') && !currentSpeaker.includes(',') // Avoid overlap confusion
                 );
                 
                 if (isSpeakerChange) {
@@ -603,8 +614,14 @@ const MedicalTranscription = () => {
                 // Reset pause detection after processing final result
                 pauseDetected = false;
                 
-                // Commit the final result with speaker label
-                completeTranscriptsRef.current.push(speakerLabel + newText);
+                // Commit the final result with speaker label - prevent duplicates
+                const finalText = speakerLabel + newText;
+                const lastEntry = completeTranscriptsRef.current[completeTranscriptsRef.current.length - 1];
+                
+                // Only add if it's different from the last entry to prevent repetition
+                if (!lastEntry || lastEntry !== finalText) {
+                  completeTranscriptsRef.current.push(finalText);
+                }
                 currentTranscript = ''; // Reset current transcript
                 
                 // Update current speaker for final results
@@ -612,9 +629,9 @@ const MedicalTranscription = () => {
                   currentSpeaker = speakerId;
                 }
                 
-                // Always update UI immediately for final results
-                const displayText = completeTranscriptsRef.current.join('\n');
-                setTranscription(displayText);
+                // Update cache and UI for final results
+                displayTextCacheRef.current = completeTranscriptsRef.current.join('\n');
+                setTranscription(displayTextCacheRef.current);
               }
             }
           }
