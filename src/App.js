@@ -210,12 +210,45 @@ const MedicalTranscription = () => {
     }
 };
 
-  const createTranscribeClient = () => new TranscribeStreamingClient({
-    region: process.env.REACT_APP_AWS_REGION || 'us-east-1',
-    credentials: {
-      accessKeyId: process.env.REACT_APP_AWS_ACCESS_KEY_ID,
-      secretAccessKey: process.env.REACT_APP_AWS_SECRET_ACCESS_KEY
-    },
+  const createTranscribeClient = () => {
+    // Debug: Log all environment variables that start with REACT_APP
+    console.log('Environment variables debug:', {
+      allReactEnvVars: Object.keys(process.env).filter(key => key.startsWith('REACT_APP')),
+      NODE_ENV: process.env.NODE_ENV,
+      PUBLIC_URL: process.env.PUBLIC_URL
+    });
+    
+    const accessKeyId = process.env.REACT_APP_AWS_ACCESS_KEY_ID;
+    const secretAccessKey = process.env.REACT_APP_AWS_SECRET_ACCESS_KEY;
+    const region = process.env.REACT_APP_AWS_REGION || 'us-east-1';
+    
+    console.log('Raw env vars:', {
+      accessKeyId: accessKeyId,
+      secretAccessKey: secretAccessKey ? '[PRESENT]' : '[MISSING]',
+      region: region
+    });
+    
+    // Validate credentials
+    if (!accessKeyId || !secretAccessKey) {
+      throw new Error('AWS credentials are missing. Check your .env file.');
+    }
+    
+    if (accessKeyId.trim() === '' || secretAccessKey.trim() === '') {
+      throw new Error('AWS credentials are empty. Check your .env file.');
+    }
+    
+    console.log('Creating Transcribe client with credentials:', {
+      accessKeyId: accessKeyId.substring(0, 8) + '...',
+      region: region,
+      hasSecretKey: !!secretAccessKey
+    });
+    
+    return new TranscribeStreamingClient({
+      region: region,
+      credentials: {
+        accessKeyId: accessKeyId.trim(),
+        secretAccessKey: secretAccessKey.trim()
+      },
     requestHandler: {
       ...new FetchHttpHandler({
         requestTimeout: 30000 // Ultra-responsive 30 second timeout
@@ -228,6 +261,7 @@ const MedicalTranscription = () => {
       duplex: 'half'
     }
   });
+  };
 
   const initializeAudioContext = useCallback(async () => {
     try {
@@ -368,7 +402,13 @@ const MedicalTranscription = () => {
       // Create transcribe client if not exists
       if (!transcribeClientRef.current) {
         console.log('Creating new AWS Transcribe client...');
-        transcribeClientRef.current = createTranscribeClient();
+        try {
+          transcribeClientRef.current = createTranscribeClient();
+        } catch (credentialError) {
+          console.error('Failed to create Transcribe client:', credentialError);
+          setTranscription(`❌ Credential Error: ${credentialError.message}`);
+          throw credentialError;
+        }
       }
       
       console.log('Sending command to AWS Transcribe...');
