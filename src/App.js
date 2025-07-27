@@ -434,8 +434,19 @@ const MedicalTranscription = () => {
       let currentSpeaker = null;
       let pauseDetected = false;
       let lastTranscriptTime = Date.now();
+      let speakerMap = new Map(); // Map AWS speaker IDs to sequential numbers
+      let nextSpeakerNumber = 0; // Next sequential speaker number to assign
       completeTranscriptsRef.current = [];
       displayTextCacheRef.current = ''; // Reset cache
+      
+      // Helper function to get sequential speaker number
+      const getSpeakerNumber = (awsSpeakerId) => {
+        if (!speakerMap.has(awsSpeakerId)) {
+          speakerMap.set(awsSpeakerId, nextSpeakerNumber);
+          nextSpeakerNumber++;
+        }
+        return speakerMap.get(awsSpeakerId);
+      };
       
       // Test if setTranscription is working
       console.log('Testing setTranscription...');
@@ -464,7 +475,7 @@ const MedicalTranscription = () => {
           const timeSinceLastTranscript = currentTime - lastTranscriptTime;
           
           // If more than 1.2 seconds has passed since last transcript, consider it a significant pause
-          // Reduced threshold to better catch speaker transitions
+          // Balanced threshold for natural speaker transitions
           if (timeSinceLastTranscript > 1200) {
             pauseDetected = true;
             console.log('Pause detected:', timeSinceLastTranscript + 'ms');
@@ -499,16 +510,17 @@ const MedicalTranscription = () => {
               if (speakers.length === 1) {
                 // Single clear speaker
                 speakerId = speakers[0];
-                speakerLabel = `[דובר ${speakerId}]: `;
+                const speakerNum = getSpeakerNumber(speakerId);
+                speakerLabel = `[דובר ${speakerNum}]: `;
               } else if (speakers.length === 2) {
                 // Two speakers detected - check confidence
                 const [speaker1, speaker2] = speakers;
                 const speaker1Ratio = speakerCounts[speaker1] / totalItems;
                 const speaker2Ratio = speakerCounts[speaker2] / totalItems;
                 
-                // Only consider multiple speakers if both have significant presence (>20% each)
-                // and the segment is long enough (>6 items) to avoid AWS false positives
-                if (totalItems >= 6 && speaker1Ratio >= 0.2 && speaker2Ratio >= 0.2) {
+                // Only consider multiple speakers if both have significant presence (>25% each)
+                // and the segment is long enough (>5 items) for reliable detection
+                if (totalItems >= 5 && speaker1Ratio >= 0.25 && speaker2Ratio >= 0.25) {
                   // Check for true overlap vs sequential speech
                   const speakers = alternative.Items
                     .filter(item => item.Speaker !== undefined)
@@ -527,18 +539,21 @@ const MedicalTranscription = () => {
                     // Use unique speakers only to avoid duplication
                     const uniqueSpeakers = [...new Set(speakers)].sort();
                     speakerId = uniqueSpeakers.join(',');
-                    speakerLabel = `[דוברים ${uniqueSpeakers.join(',')} - חפיפה]: `;
+                    const mappedSpeakers = uniqueSpeakers.map(id => getSpeakerNumber(id)).sort((a, b) => a - b);
+                    speakerLabel = `[דוברים ${mappedSpeakers.join(',')} - חפיפה]: `;
                   } else {
                     // Sequential speech - use dominant speaker
                     const dominantSpeaker = speaker1Ratio > speaker2Ratio ? speaker1 : speaker2;
                     speakerId = dominantSpeaker;
-                    speakerLabel = `[דובר ${speakerId}]: `;
+                    const speakerNum = getSpeakerNumber(speakerId);
+                    speakerLabel = `[דובר ${speakerNum}]: `;
                   }
                 } else {
                   // Use dominant speaker when confidence is low or segment is short
                   const dominantSpeaker = speakerCounts[speaker1] > speakerCounts[speaker2] ? speaker1 : speaker2;
                   speakerId = dominantSpeaker;
-                  speakerLabel = `[דובר ${speakerId}]: `;
+                  const speakerNum = getSpeakerNumber(speakerId);
+                  speakerLabel = `[דובר ${speakerNum}]: `;
                 }
               } else if (speakers.length > 2) {
                 // More than 2 speakers - likely AWS confusion, use most frequent
@@ -546,7 +561,8 @@ const MedicalTranscription = () => {
                   speakerCounts[a] > speakerCounts[b] ? a : b
                 );
                 speakerId = dominantSpeaker;
-                speakerLabel = `[דובר ${speakerId}]: `;
+                const speakerNum = getSpeakerNumber(speakerId);
+                speakerLabel = `[דובר ${speakerNum}]: `;
               }
             }
             
@@ -554,20 +570,26 @@ const MedicalTranscription = () => {
             if (!speakerId) {
               if (alternative.Speaker !== undefined && alternative.Speaker !== null) {
                 speakerId = alternative.Speaker.toString();
-                speakerLabel = `[דובר ${speakerId}]: `;
+                const speakerNum = getSpeakerNumber(speakerId);
+                speakerLabel = `[דובר ${speakerNum}]: `;
               } else if (result.Speaker !== undefined && result.Speaker !== null) {
                 speakerId = result.Speaker.toString();
-                speakerLabel = `[דובר ${speakerId}]: `;
+                const speakerNum = getSpeakerNumber(speakerId);
+                speakerLabel = `[דובר ${speakerNum}]: `;
               }
             }
             
-            // Fallback: continue with current speaker
-            if (!speakerId && currentSpeaker) {
+            // Simple fallback: use current speaker only if no pause detected
+            if (!speakerId && currentSpeaker && !pauseDetected) {
               speakerId = currentSpeaker;
               if (speakerId.includes(',')) {
-                speakerLabel = `[דוברים ${speakerId}]: `;
+                // Handle multiple speakers - map each one
+                const awsSpeakers = speakerId.split(',');
+                const mappedSpeakers = awsSpeakers.map(id => getSpeakerNumber(id)).sort((a, b) => a - b);
+                speakerLabel = `[דוברים ${mappedSpeakers.join(',')}]: `;
               } else {
-                speakerLabel = `[דובר ${speakerId}]: `;
+                const speakerNum = getSpeakerNumber(speakerId);
+                speakerLabel = `[דובר ${speakerNum}]: `;
               }
             }
   
@@ -576,10 +598,10 @@ const MedicalTranscription = () => {
               // Efficient partial processing - update on meaningful changes
               if (newText !== currentTranscript) {
                 
-                // Enhanced speaker change detection with confidence-based transitions
+                // Simple speaker change detection
                 const isDifferentSpeaker = speakerId && currentSpeaker && currentSpeaker !== speakerId;
                 
-                // Additional check: ensure speaker change is consistent across multiple partial results
+                // Basic speaker change confidence
                 const speakerChangeConfidence = speakerId && currentSpeaker ? (
                   !speakerId.includes(',') && !currentSpeaker.includes(',') && speakerId !== currentSpeaker
                 ) : false;
@@ -589,13 +611,17 @@ const MedicalTranscription = () => {
                   if (currentTranscript.trim()) {
                     let prevLabel;
                     if (currentSpeaker.includes(',')) {
+                      // Handle multiple speakers
+                      const awsSpeakers = currentSpeaker.split(',');
+                      const mappedSpeakers = awsSpeakers.map(id => getSpeakerNumber(id)).sort((a, b) => a - b);
                       if (currentSpeaker.includes('-')) {
-                        prevLabel = `[דוברים ${currentSpeaker.split(' - ')[0]} - חפיפה]: `;
+                        prevLabel = `[דוברים ${mappedSpeakers.join(',')} - חפיפה]: `;
                       } else {
-                        prevLabel = `[דוברים ${currentSpeaker}]: `;
+                        prevLabel = `[דוברים ${mappedSpeakers.join(',')}]: `;
                       }
                     } else {
-                      prevLabel = `[דובר ${currentSpeaker}]: `;
+                      const speakerNum = getSpeakerNumber(currentSpeaker);
+                      prevLabel = `[דובר ${speakerNum}]: `;
                     }
                     const newEntry = prevLabel + currentTranscript;
                     const lastEntry = completeTranscriptsRef.current[completeTranscriptsRef.current.length - 1];
@@ -620,6 +646,14 @@ const MedicalTranscription = () => {
                 // Update state with zero delay
                 currentTranscript = newText;
                 if (speakerId) {
+                  // Log new speaker detection
+                  if (!currentSpeaker || currentSpeaker !== speakerId) {
+                    console.log('Speaker detected/changed:', {
+                      from: currentSpeaker || 'none',
+                      to: speakerId,
+                      pauseDetected: pauseDetected
+                    });
+                  }
                   currentSpeaker = speakerId;
                 }
                 
@@ -692,6 +726,15 @@ const MedicalTranscription = () => {
         setTranscription('❌ Network Error - Check your internet connection');
       } else if (error.code === 'AccessDeniedException') {
         setTranscription('❌ AWS Access Denied - Check your IAM permissions');
+      } else if (error.message && error.message.includes('no new audio was received')) {
+        // Handle timeout gracefully - don't erase transcription
+        console.warn('AWS Transcribe timeout - recording stopped due to silence');
+        // Keep existing transcription and just log the warning
+        // Optionally append a timestamp note
+        const currentText = completeTranscriptsRef.current.join('\n');
+        if (currentText) {
+          setTranscription(currentText + '\n\n[הקלטה הופסקה - אין קול חדש]');
+        }
       } else {
         setTranscription(`❌ Error: ${error.message}`);
       }
