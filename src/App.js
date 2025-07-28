@@ -3,7 +3,7 @@ import { TranscribeStreamingClient, StartStreamTranscriptionCommand } from '@aws
 import { FetchHttpHandler } from "@aws-sdk/fetch-http-handler";
 import { Buffer } from 'buffer';
 import S3Service, { createSessionId } from './services/S3Service';
-import { aiAgentClean, aiAgentSummary } from './services/AgentService';
+import { aiAgentClean, aiAgentSummary, aiAgentTasks } from './services/AgentService';
 import AudioPlayer from './services/AudioPlayer';
 import DictionaryEditor from './services/DictionaryEditor';
 import TextDisplay from './services/TextDisplay';
@@ -84,6 +84,30 @@ const MedicalTranscription = () => {
     } catch (error) {
       console.error('Error generating summary:', error);
       setError('שגיאה ביצירת סיכום');
+    } finally {
+      setIsProcessingAI(false);
+    }
+  };
+
+  const handleAITasks = async () => {
+    if (!sessionId) {
+      setError('No active session');
+      return;
+    }
+    
+    try {
+      setIsProcessingAI(true);
+      
+      // Create a progress handler
+      const handleProgress = (progressText) => {
+        setTranscription(progressText);
+      };
+      
+      await aiAgentTasks(sessionId, handleProgress);
+      
+    } catch (error) {
+      console.error('Error extracting tasks:', error);
+      setError('שגיאה בחילוץ משימות');
     } finally {
       setIsProcessingAI(false);
     }
@@ -998,23 +1022,6 @@ const MedicalTranscription = () => {
         {/* AI Processing Controls */}
         <div className="grid grid-cols-3 gap-4 mb-6">
           <button
-            onClick={handleCleanText}
-            disabled={!transcription || isProcessingAI}
-            className={`btn-secondary ${(!transcription || isProcessingAI) ? 'opacity-50 cursor-not-allowed' : ''}`}
-          >
-            {isProcessingAI ? (
-              <span className="flex items-center justify-center">
-                <svg className="animate-spin h-5 w-5 mr-3" viewBox="0 0 24 24">
-                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
-                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
-                </svg>
-                מעבד...
-              </span>
-            ) : (
-              'ניקוי טקסט 🧹'
-            )}
-          </button>
-          <button
             onClick={handleAISummary}
             disabled={!transcription || isProcessingAI}
             className={`btn-secondary ${(!transcription || isProcessingAI) ? 'opacity-50 cursor-not-allowed' : ''}`}
@@ -1028,7 +1035,24 @@ const MedicalTranscription = () => {
                 מעבד...
               </span>
             ) : (
-              'סיכום AI 🤖'
+              'סיכום טקסט 📝'
+            )}
+          </button>
+          <button
+            onClick={handleAITasks}
+            disabled={!transcription || isProcessingAI}
+            className={`btn-secondary ${(!transcription || isProcessingAI) ? 'opacity-50 cursor-not-allowed' : ''}`}
+          >
+            {isProcessingAI ? (
+              <span className="flex items-center justify-center">
+                <svg className="animate-spin h-5 w-5 mr-3" viewBox="0 0 24 24">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                </svg>
+                מעבד...
+              </span>
+            ) : (
+              'חילוץ משימות 📋'
             )}
           </button>
           <DictionaryEditor />
