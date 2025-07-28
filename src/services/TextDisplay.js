@@ -1,5 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
+import { aiAgentSummary, aiAgentTasks } from './AgentService';
 
 const TextDisplay = ({ text, sessionId }) => {
   const [showCopy, setShowCopy] = useState(false);
@@ -49,9 +50,33 @@ const TextDisplay = ({ text, sessionId }) => {
     });
 
     try {
-      const key = type === 'cleaned' 
-        ? `clean-texts/${sessionId}.json`
-        : `ai-summaries/${sessionId}.json`;
+      let key, processText;
+      
+      // Set the correct S3 path and text processing logic for each type
+      switch (type) {
+        case 'original':
+          key = `transcriptions/${sessionId}.json`;
+          processText = (data) => {
+            // Handle different transcription formats
+            if (data.results?.transcripts) {
+              return data.results.transcripts[0]?.transcript || '';
+            } else if (data.content) {
+              return data.content;
+            }
+            return '';
+          };
+          break;
+        case 'tasks':
+          key = `tasks/${sessionId}.json`;
+          processText = (data) => data.summary || '';
+          break;
+        case 'summary':
+          key = `ai-summaries/${sessionId}.json`;
+          processText = (data) => data.summary || '';
+          break;
+        default:
+          throw new Error(`Unknown text type: ${type}`);
+      }
 
       const command = new GetObjectCommand({
         Bucket: "product.transcriber",
@@ -70,14 +95,12 @@ const TextDisplay = ({ text, sessionId }) => {
       }
 
       const data = JSON.parse(result);
-      const processedText = type === 'cleaned' ? data.html : data.summary;
+      const processedText = processText(data);
       setCurrentText(processedText?.split('\\n').join('\n') || '');
       setTextType(type);
     } catch (error) {
       console.error(`Error fetching ${type} text:`, error);
-      setError(`Failed to load ${type} text`);
-      setCurrentText(text);
-      setTextType('original');
+      throw error; // Re-throw to allow fallback logic
     } finally {
       setIsLoading(false);
     }
@@ -88,14 +111,20 @@ const TextDisplay = ({ text, sessionId }) => {
     const isActive = textType === type;
     
     switch (type) {
-      case 'cleaned':
-        return `${baseClasses} ${isActive 
-          ? 'bg-green-600 ring-2 ring-green-300' 
-          : 'bg-green-500 hover:bg-green-600'}`;
+      case 'copy':
+        return `${baseClasses} bg-blue-500 hover:bg-blue-600`;
+      case 'original':
+        return `${baseClasses} bg-blue-500 hover:bg-blue-600 ${isActive 
+          ? 'ring-2 ring-blue-300' 
+          : ''}`;
+      case 'tasks':
+        return `${baseClasses} bg-blue-500 hover:bg-blue-600 ${isActive 
+          ? 'ring-2 ring-blue-300' 
+          : ''}`;
       case 'summary':
-        return `${baseClasses} ${isActive 
-          ? 'bg-purple-600 ring-2 ring-purple-300' 
-          : 'bg-purple-500 hover:bg-purple-600'}`;
+        return `${baseClasses} bg-blue-500 hover:bg-blue-600 ${isActive 
+          ? 'ring-2 ring-blue-300' 
+          : ''}`;
       default:
         return `${baseClasses} bg-blue-500 hover:bg-blue-600`;
     }
@@ -129,27 +158,61 @@ const TextDisplay = ({ text, sessionId }) => {
           </button>
 
           <button
-            onClick={() => {
-              if (textType === 'cleaned') {
-                setCurrentText(text);
-                setTextType('original');
-              } else {
-                fetchTextFromS3('cleaned');
+            onClick={async () => {
+              if (textType === 'original') {
+                return; // Already showing original text
+              }
+              try {
+                // Fetch original transcription from S3
+                await fetchTextFromS3('original');
+              } catch (error) {
+                console.error('Original transcription not found in S3:', error);
+                setError('No transcription found for this session');
               }
             }}
-            className={getButtonClassName('cleaned')}
+            className={getButtonClassName('original')}
             disabled={isLoading}
           >
-            טקסט מנוקה
+            טקסט גולמי
           </button>
 
           <button
-            onClick={() => {
-              if (textType === 'summary') {
+            onClick={async () => {
+              if (textType === 'tasks') {
+                // If already showing tasks, go back to original
                 setCurrentText(text);
                 setTextType('original');
               } else {
-                fetchTextFromS3('summary');
+                // ONLY fetch tasks from S3 - no generation
+                try {
+                  await fetchTextFromS3('tasks');
+                } catch (error) {
+                  console.error('Tasks not found in S3:', error);
+                  setError('No tasks found for this session');
+                  // Don't generate - just show error
+                }
+              }
+            }}
+            className={getButtonClassName('tasks')}
+            disabled={isLoading}
+          >
+            משימות
+          </button>
+
+          <button
+            onClick={async () => {
+              if (textType === 'summary') {
+                // If already showing summary, go back to original
+                setCurrentText(text);
+                setTextType('original');
+              } else {
+                // ONLY fetch summary from S3 - no generation
+                try {
+                  await fetchTextFromS3('summary');
+                } catch (error) {
+                  console.error('Summary not found in S3:', error);
+                  setError('No summary found for this session');
+                }
               }
             }}
             className={getButtonClassName('summary')}

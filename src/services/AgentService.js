@@ -286,7 +286,96 @@ async function getTranscriptionContent(sessionId) {
   }
 }
 
-// Update the aiAgentClean function to properly handle the content
+// Text cleaning function for cleaned text
+export const aiAgentCleanText = async (sessionId, onProgress) => {
+  if (!sessionId) {
+    throw new Error('No session ID provided');
+  }
+
+  try {
+    // Get transcription content
+    const transcriptionContent = await getTranscriptionContent(sessionId);
+    
+    if (!transcriptionContent) {
+      throw new Error('No transcription content found');
+    }
+
+    console.log('Initializing Bedrock client for text cleaning...');
+    
+    const bedrockClient = new BedrockRuntimeClient({
+      region: process.env.REACT_APP_AWS_REGION || 'us-east-1',
+      credentials: {
+        accessKeyId: process.env.REACT_APP_AWS_ACCESS_KEY_ID,
+        secretAccessKey: process.env.REACT_APP_AWS_SECRET_ACCESS_KEY
+      }
+    });
+
+    const requestBody = {
+      anthropic_version: "bedrock-2023-05-31",
+      max_tokens: 3000,
+      temperature: 0,
+      system: "התפקיד שלך לנקות ולשפר את הטקסט הגולמי של התמלול. אל תוסיף הקדמה או סיכום. בצע את השינויים הבאים:\n1. תקן שגיאות כתיב וטעויות הקלדה\n2. הוסף סימני פיסוק נכונים (נקודות, פסיקים, סימני שאלה)\n3. תקן ספירת מילים ומספרים (לדוגמא: 'חמישים' ל-50)\n4. הוסף פסקאות ופיסוק נכון\n5. שמור על התוכן המקורי ללא שינוי משמעות\n6. הוצא חזרות מיותרות\n7. השב בעברית בלבד",
+      messages: [
+        {
+          role: "user",
+          content: [{ type: "text", text: transcriptionContent }]
+        }
+      ]
+    };
+
+    const command = new InvokeModelWithResponseStreamCommand({
+      modelId: "anthropic.claude-3-sonnet-20240229-v1:0",
+      body: JSON.stringify(requestBody),
+      contentType: "application/json",
+      accept: "application/json",
+    });
+
+    const response = await bedrockClient.send(command);
+    let fullResponse = '';
+
+    try {
+      for await (const chunk of response.body) {
+        const decoder = new TextDecoder();
+        const chunkText = decoder.decode(chunk.chunk.bytes);
+        const parsedChunk = JSON.parse(chunkText);
+
+        if (parsedChunk.type === 'content_block_delta') {
+          const deltaText = parsedChunk.delta.text;
+          fullResponse += deltaText;
+
+          if (onProgress) {
+            onProgress(fullResponse);
+          }
+        }
+      }
+
+      console.log('Text cleaning completed, applying medical replacements...');
+
+      // Apply medical term replacements to the cleaned text
+      const processedResult = await applyMedicalReplacements(fullResponse);
+
+      // Save the processed text to S3
+      await saveCleanedText(sessionId, fullResponse);
+
+      // Update the progress with the final processed HTML
+      if (onProgress) {
+        onProgress(processedResult.html);
+      }
+
+      return processedResult.html;
+      
+    } catch (streamError) {
+      console.error('Error processing stream:', streamError);
+      throw new Error(`Stream processing error: ${streamError.message}`);
+    }
+    
+  } catch (error) {
+    console.error('AI processing error:', error);
+    throw new Error(`Failed to process text: ${error.message}`);
+  }
+};
+
+// Text summary function (renamed from aiAgentClean)
 export const aiAgentClean = async (sessionId, onProgress) => {
   if (!sessionId) {
     throw new Error('No session ID provided');
@@ -317,7 +406,7 @@ export const aiAgentClean = async (sessionId, onProgress) => {
       anthropic_version: "bedrock-2023-05-31",
       max_tokens: 3000,
       temperature: 0,
-      system: ".התפקיד שלך לנקות את הטקסט ולשמור עליו כמו שהוא בצורה הגולמית שלו, אל תוסיף הקדמה בהתחה וסיכום סוף. הדבר שצרי לשנות:1. סימני פיסוק לדוגמא נקודותיים יוחלף ל :. 2.מספרים נומרים כשאפשר לדוגמא: חמישים יוחלף ל50",
+      system: "התפקיד שלך ליצור סיכום קצר וברור של השיחה. עליך לכלול את הנקודות החשובות ביותר.\n\nהסיכום צריך לכלול:\n1. נושאים עיקריים שנדונו\n2. נקודות חשובות שהועלו\n3. מידע משמעותי מהשיחה\n4. החלטות או מסקנות (אם יש)\n5. נושאים מרכזיים\n\nכללים:\n- כתוב סיכום קצר וברור\n- שמור על הנקודות החשובות ביותר\n- אל תוסיף מידע שלא היה בשיחה\n- ארגן את המידע בצורה לוגית\n- השב בעברית בלבד",
       messages: [
         {
           role: "user",
@@ -418,7 +507,142 @@ async function getCleanedText(sessionId) {
   }
 }
 
-export const aiAgentSummary = async (sessionId, onProgress) => {
+// Tasks extraction function (for משימות button)
+export const aiAgentTasks = async (sessionId, onProgress, rawText = null) => {
+  if (!sessionId) {
+    throw new Error('No session ID provided');
+  }
+
+  try {
+    let textToAnalyze;
+    
+    // Use provided raw text first if available
+    if (rawText) {
+      textToAnalyze = rawText;
+    } else {
+      // Try to get cleaned text first
+      try {
+        const cleanedText = await getCleanedText(sessionId);
+        const parsedText = JSON.parse(cleanedText);
+        textToAnalyze = parsedText.raw || parsedText.html;
+      } catch (error) {
+        console.log('Cleaned text not found, falling back to original transcription');
+        // If cleaned text isn't available, get original transcription
+        textToAnalyze = await getTranscriptionContent(sessionId);
+      }
+    }
+
+    if (!textToAnalyze) {
+      throw new Error('No text content found to analyze');
+    }
+    
+    console.log('Initializing Bedrock client for tasks extraction...');
+    
+    const bedrockClient = new BedrockRuntimeClient({
+      region: process.env.REACT_APP_AWS_REGION || 'us-east-1',
+      credentials: {
+        accessKeyId: process.env.REACT_APP_AWS_ACCESS_KEY_ID,
+        secretAccessKey: process.env.REACT_APP_AWS_SECRET_ACCESS_KEY
+      }
+    });
+
+    const systemPrompt = `התפקיד שלך לחלץ משימות ופעולות מהטקסט. עליך לזהות ולרשום את כל המשימות, הפעולות והתחייבויות שמוזכרות בשיחה.
+
+חלץ ורשום בעברית:
+1. משימות שצריך לבצע
+2. פעולות שיש לעשות
+3. התחייבויות שהוזכרו
+4. דברים שצריך לזכור
+5. מטלות עתידיות
+6. מעקבים נדרשים
+7. החלטות שהתקבלו
+
+עבור כל משימה ציין:
+- מה צריך לעשות
+- מי אחראי (אם מוזכר)
+- מתי (אם מוזכר)
+- פרטים נוספים רלוונטיים
+
+הצג את התוצאות כרשימה ברורה בעברית בלבד.`;
+
+    const requestBody = {
+      anthropic_version: "bedrock-2023-05-31",
+      max_tokens: 3000,
+      temperature: 0,
+      system: systemPrompt,
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: `חלץ משימות ופעולות מהטקסט הבא: \n\n${textToAnalyze}`
+            }
+          ]
+        }
+      ]
+    };
+
+    console.log('Sending tasks extraction request to Bedrock...');
+
+    const command = new InvokeModelWithResponseStreamCommand({
+      modelId: "anthropic.claude-3-sonnet-20240229-v1:0",
+      body: JSON.stringify(requestBody),
+      contentType: "application/json",
+      accept: "application/json",
+    });
+
+    const response = await bedrockClient.send(command);
+    let fullResponse = '';
+    
+    try {
+      for await (const chunk of response.body) {
+        const decoder = new TextDecoder();
+        const chunkText = decoder.decode(chunk.chunk.bytes);
+        const parsedChunk = JSON.parse(chunkText);
+        
+        if (parsedChunk.type === 'content_block_delta') {
+          const deltaText = parsedChunk.delta.text;
+          fullResponse += deltaText;
+          
+          if (onProgress) {
+            onProgress(fullResponse);
+          }
+        }
+      }
+      
+      console.log('Tasks extraction completed successfully');
+      
+      // Save the tasks to S3
+      const tasksData = {
+        sessionId,
+        timestamp: new Date().toISOString(),
+        summary: fullResponse,
+        originalText: textToAnalyze
+      };
+
+      await saveToS3(
+        'product.transcriber',
+        `tasks/${sessionId}.json`,
+        JSON.stringify(tasksData, null, 2),
+        'application/json'
+      );
+      
+      return fullResponse;
+      
+    } catch (streamError) {
+      console.error('Error processing tasks stream:', streamError);
+      throw new Error(`Stream processing error: ${streamError.message}`);
+    }
+    
+  } catch (error) {
+    console.error('AI tasks extraction error:', error);
+    throw new Error(`Failed to extract tasks: ${error.message}`);
+  }
+};
+
+// Summary function (for סיכום button)
+export const aiAgentSummary = async (sessionId, onProgress, rawText = null) => {
   if (!sessionId) {
     throw new Error('No session ID provided');
   }
@@ -426,15 +650,20 @@ export const aiAgentSummary = async (sessionId, onProgress) => {
   try {
     let textToSummarize;
     
-    // Try to get cleaned text first
-    try {
-      const cleanedText = await getCleanedText(sessionId);
-      const parsedText = JSON.parse(cleanedText);
-      textToSummarize = parsedText.raw || parsedText.html;
-    } catch (error) {
-      console.log('Cleaned text not found, falling back to original transcription');
-      // If cleaned text isn't available, get original transcription
-      textToSummarize = await getTranscriptionContent(sessionId);
+    // Use provided raw text first if available
+    if (rawText) {
+      textToSummarize = rawText;
+    } else {
+      // Try to get cleaned text first
+      try {
+        const cleanedText = await getCleanedText(sessionId);
+        const parsedText = JSON.parse(cleanedText);
+        textToSummarize = parsedText.raw || parsedText.html;
+      } catch (error) {
+        console.log('Cleaned text not found, falling back to original transcription');
+        // If cleaned text isn't available, get original transcription
+        textToSummarize = await getTranscriptionContent(sessionId);
+      }
     }
 
     if (!textToSummarize) {
@@ -451,18 +680,21 @@ export const aiAgentSummary = async (sessionId, onProgress) => {
       }
     });
 
-    const systemPrompt = `You are a medical transcription assistant tasked with creating concise, accurate summaries of medical conversations.
-    Your summaries should:
-    1. Maintain all relevant medical information
-    2. Organize information logically
-    3. Use clear, professional language
-    4. Preserve any specific numbers, measurements, or dosages
-    5. Include key patient complaints, symptoms, and diagnoses
-    6. Highlight any important actions or follow-ups
-    7. Answer in detected language
+    const systemPrompt = `התפקיד שלך ליצור סיכום קצר וברור של השיחה. עליך לכלול את הנקודות החשובות ביותר.
 
-    Format the summary with appropriate headers and bullet points when relevant.
-    Keep medical terminology intact but provide clear context.`;
+הסיכום צריך לכלול:
+1. נושאים עיקריים שנדונו
+2. נקודות חשובות שהועלו
+3. מידע משמעותי מהשיחה
+4. החלטות או מסקנות (אם יש)
+5. נושאים מרכזיים
+
+כללים:
+- כתוב סיכום קצר וברור
+- שמור על הנקודות החשובות ביותר
+- אל תוסיף מידע שלא היה בשיחה
+- ארגן את המידע בצורה לוגית
+- השב בעברית בלבד`;
 
     const requestBody = {
       anthropic_version: "bedrock-2023-05-31",
@@ -475,7 +707,7 @@ export const aiAgentSummary = async (sessionId, onProgress) => {
           content: [
             {
               type: "text",
-              text: `Please provide a clear, structured summary of this medical conversation: \n\n${textToSummarize}`
+              text: `סכם את השיחה הבאה: \n\n${textToSummarize}`
             }
           ]
         }
